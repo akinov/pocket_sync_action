@@ -1,0 +1,320 @@
+name: "pocket_sync"
+description: "Pocketに保存されたアイテムを定期的に取得し、マークダウン形式でリポジトリに保存してPRを作成します。"
+inputs:
+  consumer_key:
+    description: "PocketアプリのConsumer Key"
+    required: true
+  access_token:
+    description: "ユーザーのPocket Access Token"
+    required: true
+  github_token:
+    description: "GitHub APIにアクセスするためのトークン。通常は github.token を使用します。"
+    required: true
+  output_dir:
+    description: "マークダウンファイルを保存するディレクトリ"
+    required: false
+    default: "articles"
+  state:
+    description: "取得するアイテムの状態（'unread', 'archive', 'all'）"
+    required: false
+    default: "all"
+  favorite:
+    description: "お気に入りフィルター（'0' = 非お気に入りのみ, '1' = お気に入りのみ, '' = すべて）"
+    required: false
+    default: ""
+  tag:
+    description: "特定のタグでフィルタリング"
+    required: false
+    default: ""
+  count:
+    description: "1回のリクエストで取得するアイテムの最大数（Pocket APIの制限に近い値）"
+    required: false
+    default: "100"
+  max_items:
+    description: "取得する総アイテム数の上限（0=制限なし、すべての記事を取得）"
+    required: false
+    default: "0"
+  sort:
+    description: "ソート順（'newest', 'oldest', 'title', 'site'）"
+    required: false
+    default: "newest"
+  pr_title:
+    description: "作成するPRのタイトル"
+    required: false
+    default: "Pocketから記事データを追加"
+  pr_branch_prefix:
+    description: "PRのブランチ名のプレフィックス"
+    required: false
+    default: "pocket-articles"
+
+runs:
+  using: "composite"
+  steps:
+    - name: 必要なツールのインストール
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq curl
+    - name: 既存の記事から最新のタイムスタンプを取得
+      id: get-latest-timestamp
+      shell: bash
+      run: |
+        # 出力ディレクトリが存在するか確認
+        if [ -d "${{ inputs.output_dir }}" ]; then
+          echo "記事ディレクトリが存在します: ${{ inputs.output_dir }}"
+
+          # ファイル名から日付を抽出（YYYY-MM-DD形式）
+          LATEST_DATE=""
+          LATEST_TIMESTAMP=0
+
+          # 記事ファイルを検索し、最新の日付を特定
+          for file in $(find "${{ inputs.output_dir }}" -name "*.md" | sort); do
+            # ファイル名から日付部分を抽出（最初の10文字がYYYY-MM-DD形式と仮定）
+            FILENAME=$(basename "$file")
+            if [[ $FILENAME =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})- ]]; then
+              FILE_DATE="${BASH_REMATCH[1]}"
+
+              # ファイル内容から追加日時を抽出
+              TIME_ADDED=$(grep -o "追加日時: [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}" "$file" | sed 's/追加日時: //')
+
+              # 日付をUNIXタイムスタンプに変換（日付の終わりを23:59:59と仮定）
+              FILE_TIMESTAMP=$(date -d "${TIME_ADDED} 23:59:59" +%s)
+
+              # 最新のタイムスタンプを更新
+              if [ $FILE_TIMESTAMP -gt $LATEST_TIMESTAMP ]; then
+                LATEST_TIMESTAMP=$FILE_TIMESTAMP
+                LATEST_DATE=$TIME_ADDED
+              fi
+            fi
+          done
+
+          if [ -n "$LATEST_DATE" ]; then
+            echo "最新の記事日付: $LATEST_DATE (タイムスタンプ: $LATEST_TIMESTAMP)"
+            echo "latest_date=$LATEST_DATE" >> "$GITHUB_OUTPUT"
+            echo "latest_timestamp=$LATEST_TIMESTAMP" >> "$GITHUB_OUTPUT"
+            echo "has_articles=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "記事ファイルが見つかりませんでした"
+            echo "has_articles=false" >> "$GITHUB_OUTPUT"
+          fi
+        else
+          echo "記事ディレクトリが存在しません: ${{ inputs.output_dir }}"
+          echo "has_articles=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Pocket APIからデータを取得
+      id: fetch-pocket-data
+      shell: bash
+      run: |
+        # 最新の記事タイムスタンプがある場合は、それ以降の記事のみを取得
+        SINCE_PARAM=""
+        if [[ "${{ steps.get-latest-timestamp.outputs.has_articles }}" == "true" ]]; then
+          # Pocket APIのsince引数はUNIXタイムスタンプ（秒）
+          SINCE_TIMESTAMP=${{ steps.get-latest-timestamp.outputs.latest_timestamp }}
+          echo "最新の記事以降のデータを取得します（${{ steps.get-latest-timestamp.outputs.latest_date }} 以降）"
+          SINCE_PARAM="\"since\": \"$SINCE_TIMESTAMP\","
+        else
+          echo "既存の記事がないため、すべてのデータを取得します"
+        fi
+
+        # 一時ファイルの初期化
+        echo "[]" > all_items.json
+
+        # ページネーション用の変数
+        OFFSET=0
+        TOTAL_ITEMS=0
+        MAX_ITEMS=${{ inputs.max_items }}
+        HAS_MORE=true
+
+        # すべての記事を取得するまでループ
+        while $HAS_MORE; do
+          echo "ページ ${OFFSET} からデータを取得中..."
+
+          # APIリクエストパラメータの構築
+          REQUEST_PARAMS=$(cat <<EOF
+          {
+            "consumer_key": "${{ inputs.consumer_key }}",
+            "access_token": "${{ inputs.access_token }}",
+            ${SINCE_PARAM}
+            "state": "${{ inputs.state }}",
+            "favorite": "${{ inputs.favorite }}",
+            "tag": "${{ inputs.tag }}",
+            "count": "${{ inputs.count }}",
+            "offset": "${OFFSET}",
+            "sort": "${{ inputs.sort }}",
+            "detailType": "complete"
+          }
+          EOF
+          )
+
+          # Pocket APIへのリクエスト
+          echo "Pocket APIにリクエストを送信中..."
+          RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json; charset=UTF-8" \
+            -H "X-Accept: application/json" \
+            -d "$REQUEST_PARAMS" \
+            https://getpocket.com/v3/get)
+
+          # レスポンスの確認
+          if [[ $(echo "$RESPONSE" | jq -r 'has("list")') == "true" ]]; then
+            # 取得したアイテム数を確認
+            BATCH_COUNT=$(echo "$RESPONSE" | jq -r '.list | length')
+            echo "取得したアイテム数: $BATCH_COUNT"
+
+            if [ $BATCH_COUNT -eq 0 ]; then
+              echo "これ以上のアイテムはありません"
+              HAS_MORE=false
+            else
+              # 取得したアイテムを一時ファイルに追加
+              echo "$RESPONSE" | jq -r '.list | to_entries | map({
+                id: .key,
+                title: .value.resolved_title // .value.given_title,
+                url: .value.resolved_url // .value.given_url,
+                excerpt: .value.excerpt,
+                time_added: .value.time_added,
+                tags: (.value.tags | if . then keys else [] end)
+              })' > batch_items.json
+
+              # 既存のアイテムと結合
+              jq -s '.[0] + .[1]' all_items.json batch_items.json > combined_items.json
+              mv combined_items.json all_items.json
+
+              # 次のページのオフセットを設定
+              OFFSET=$((OFFSET + BATCH_COUNT))
+              TOTAL_ITEMS=$((TOTAL_ITEMS + BATCH_COUNT))
+
+              # 最大アイテム数に達したかチェック
+              if [ $MAX_ITEMS -gt 0 ] && [ $TOTAL_ITEMS -ge $MAX_ITEMS ]; then
+                echo "最大アイテム数 $MAX_ITEMS に達しました"
+                HAS_MORE=false
+              fi
+
+              # 次のリクエストの前に少し待機（API制限を考慮）
+              sleep 1
+            fi
+          else
+            echo "データの取得に失敗しました"
+            echo "$RESPONSE" > pocket_error.json
+            echo "エラーレスポンス: $RESPONSE"
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            echo "error_message=$(echo "$RESPONSE" | jq -r '.error // "Unknown error"')" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+        done
+
+        # 最終的な結果を保存
+        echo "合計 $TOTAL_ITEMS 件のアイテムを取得しました"
+
+        if [ $TOTAL_ITEMS -gt 0 ]; then
+          # 取得したデータを時間順にソート
+          jq 'sort_by(.time_added) | reverse' all_items.json > sorted_items.json
+
+          # 最大アイテム数で切り詰め（設定されている場合）
+          if [ $MAX_ITEMS -gt 0 ]; then
+            jq ".[0:$MAX_ITEMS]" sorted_items.json > limited_items.json
+            mv limited_items.json sorted_items.json
+          fi
+
+          # 結果をGitHub Outputsに設定
+          echo "POCKET_ITEMS<<EOF" >> "$GITHUB_OUTPUT"
+          cat sorted_items.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "success=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "取得したアイテムはありませんでした"
+          echo "POCKET_ITEMS=[]" >> "$GITHUB_OUTPUT"
+          echo "success=true" >> "$GITHUB_OUTPUT"
+        fi
+    - name: マークダウンファイルを作成
+      if: steps.fetch-pocket-data.outputs.success == 'true'
+      id: create-markdown
+      shell: bash
+      run: |
+        # 出力ディレクトリの作成
+        mkdir -p ${{ inputs.output_dir }}
+
+        # タイムスタンプの生成
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+
+        # 新しいブランチを作成
+        BRANCH_NAME="${{ inputs.pr_branch_prefix }}-${TIMESTAMP}"
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git checkout -b $BRANCH_NAME
+
+        # 記事データをマークダウンファイルとして保存
+        POCKET_ITEMS='${{ steps.fetch-pocket-data.outputs.POCKET_ITEMS }}'
+
+        # 記事ごとにマークダウンファイルを作成
+        echo "$POCKET_ITEMS" | jq -c '.[]' | while read -r item; do
+          # 記事IDと追加日時を取得
+          ITEM_ID=$(echo "$item" | jq -r '.id')
+          ADDED_DATE=$(echo "$item" | jq -r '.time_added | tonumber | strftime("%Y-%m-%d")')
+
+          # タイトルを取得し、ファイル名に使用できる形式に変換
+          TITLE=$(echo "$item" | jq -r '.title')
+          SAFE_TITLE=$(echo "$TITLE" | tr -c '[:alnum:]' '_' | tr -s '_' | tr '[:upper:]' '[:lower:]')
+
+          # ファイル名を生成（日付-ID-タイトル.md）
+          FILENAME="${ADDED_DATE}-${ITEM_ID}-${SAFE_TITLE:0:50}.md"
+
+          # マークダウンコンテンツを生成
+          URL=$(echo "$item" | jq -r '.url')
+          EXCERPT=$(echo "$item" | jq -r '.excerpt // ""')
+          TAGS=$(echo "$item" | jq -r '.tags | join(", ")')
+
+          # マークダウンファイルを作成
+          cat > "${{ inputs.output_dir }}/$FILENAME" << EOF
+# ${TITLE}
+
+- URL: ${URL}
+- 追加日時: ${ADDED_DATE}
+$([ -n "$TAGS" ] && echo "- タグ: ${TAGS}")
+
+## 概要
+
+${EXCERPT}
+
+EOF
+
+          # ファイルをGitに追加
+          git add "${{ inputs.output_dir }}/$FILENAME"
+        done
+
+        # 変更があるか確認
+        if [ -n "$(git status --porcelain)" ]; then
+          # コミットを作成
+          git commit -m "${{ inputs.pr_title }}"
+
+          # リモートにプッシュ
+          git push origin $BRANCH_NAME
+
+          # PRの作成
+          PR_BODY="# Pocketから記事データを追加
+
+このPRは自動的に作成されました。Pocket APIから取得した記事データをマークダウン形式で追加しています。
+
+## 追加された記事
+$(echo "$POCKET_ITEMS" | jq -r '.[] | "- [\(.title)](\(.url))"')
+"
+
+          echo "$PR_BODY" > /tmp/pr_body.md
+          PR_URL=$(gh pr create --title "${{ inputs.pr_title }}" --body-file=/tmp/pr_body.md --base ${{ github.ref_name }} --head $BRANCH_NAME)
+
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+          echo "created_pr=true" >> "$GITHUB_OUTPUT"
+          echo "PRを作成しました: $PR_URL"
+        else
+          echo "新しい記事はありませんでした。PRは作成されません。"
+          echo "created_pr=false" >> "$GITHUB_OUTPUT"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+
+    - name: エラーを報告
+      if: steps.fetch-pocket-data.outputs.success == 'false'
+      shell: bash
+      run: |
+        echo "❌ Pocketデータの取得に失敗しました: ${{ steps.fetch-pocket-data.outputs.error_message }}"
+        exit 1
