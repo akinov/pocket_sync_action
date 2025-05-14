@@ -1,4 +1,4 @@
-name: "pocket_sync"
+name: "pocket-retrieve"
 description: "Pocketに保存されたアイテムを定期的に取得し、マークダウン形式でリポジトリに保存してPRを作成します。"
 inputs:
   consumer_key:
@@ -60,6 +60,7 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y jq curl
+
     - name: Pocket API認証フローの実行
       id: pocket-auth
       if: inputs.access_token == ''
@@ -125,6 +126,7 @@ runs:
           echo "error_message=リクエストトークンの取得に失敗しました" >> "$GITHUB_OUTPUT"
           exit 1
         fi
+
     - name: 既存の記事から最新のタイムスタンプを取得
       id: get-latest-timestamp
       shell: bash
@@ -171,6 +173,7 @@ runs:
           echo "記事ディレクトリが存在しません: ${{ inputs.output_dir }}"
           echo "has_articles=false" >> "$GITHUB_OUTPUT"
         fi
+
     - name: Pocket APIからデータを取得
       id: fetch-pocket-data
       shell: bash
@@ -309,6 +312,7 @@ runs:
           echo "POCKET_ITEMS=[]" >> "$GITHUB_OUTPUT"
           echo "success=true" >> "$GITHUB_OUTPUT"
         fi
+
     - name: マークダウンファイルを作成
       if: steps.fetch-pocket-data.outputs.success == 'true'
       id: create-markdown
@@ -348,32 +352,19 @@ runs:
           TAGS=$(echo "$item" | jq -r '.tags | join(", ")')
 
           # マークダウンファイルを作成
+          # マークダウンファイルを作成（heredocを使わない方法）
+          echo "# ${TITLE}" > "${{ inputs.output_dir }}/$FILENAME"
+          echo "" >> "${{ inputs.output_dir }}/$FILENAME"
+          echo "- URL: ${URL}" >> "${{ inputs.output_dir }}/$FILENAME"
+          echo "- 追加日時: ${ADDED_DATE}" >> "${{ inputs.output_dir }}/$FILENAME"
           if [ -n "$TAGS" ]; then
-            cat > "${{ inputs.output_dir }}/$FILENAME" << EOF
-# ${TITLE}
-
-- URL: ${URL}
-- 追加日時: ${ADDED_DATE}
-- タグ: ${TAGS}
-
-## 概要
-
-${EXCERPT}
-
-EOF
-          else
-            cat > "${{ inputs.output_dir }}/$FILENAME" << EOF
-# ${TITLE}
-
-- URL: ${URL}
-- 追加日時: ${ADDED_DATE}
-
-## 概要
-
-${EXCERPT}
-
-EOF
+            echo "- タグ: ${TAGS}" >> "${{ inputs.output_dir }}/$FILENAME"
           fi
+          echo "" >> "${{ inputs.output_dir }}/$FILENAME"
+          echo "## 概要" >> "${{ inputs.output_dir }}/$FILENAME"
+          echo "" >> "${{ inputs.output_dir }}/$FILENAME"
+          echo "${EXCERPT}" >> "${{ inputs.output_dir }}/$FILENAME"
+          echo "" >> "${{ inputs.output_dir }}/$FILENAME"
 
           # ファイルをGitに追加
           git add "${{ inputs.output_dir }}/$FILENAME"
@@ -388,15 +379,12 @@ EOF
           git push origin $BRANCH_NAME
 
           # PRの作成
-          PR_BODY="# Pocketから記事データを追加
-
-このPRは自動的に作成されました。Pocket APIから取得した記事データをマークダウン形式で追加しています。
-
-## 追加された記事
-$(echo "$POCKET_ITEMS" | jq -r '.[] | "- [\(.title)](\(.url))"')
-"
-
-          echo "$PR_BODY" > /tmp/pr_body.md
+          echo "# Pocketから記事データを追加" > /tmp/pr_body.md
+          echo "" >> /tmp/pr_body.md
+          echo "このPRは自動的に作成されました。Pocket APIから取得した記事データをマークダウン形式で追加しています。" >> /tmp/pr_body.md
+          echo "" >> /tmp/pr_body.md
+          echo "## 追加された記事" >> /tmp/pr_body.md
+          echo "$POCKET_ITEMS" | jq -r '.[] | "- [\(.title)](\(.url))"' >> /tmp/pr_body.md
           PR_URL=$(gh pr create --title "${{ inputs.pr_title }}" --body-file=/tmp/pr_body.md --base ${{ github.ref_name }} --head $BRANCH_NAME)
 
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
