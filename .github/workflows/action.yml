@@ -5,8 +5,13 @@ inputs:
     description: "PocketアプリのConsumer Key"
     required: true
   access_token:
-    description: "ユーザーのPocket Access Token"
-    required: true
+    description: "ユーザーのPocket Access Token（省略時は認証フローを開始します）"
+    required: false
+    default: ""
+  redirect_uri:
+    description: "Pocket認証後のリダイレクトURI（認証フロー使用時のみ必要）"
+    required: false
+    default: "https://github.com"
   github_token:
     description: "GitHub APIにアクセスするためのトークン。通常は github.token を使用します。"
     required: true
@@ -55,6 +60,71 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y jq curl
+    - name: Pocket API認証フローの実行
+      id: pocket-auth
+      if: inputs.access_token == ''
+      shell: bash
+      run: |
+        echo "Pocket Access Tokenが提供されていないため、認証フローを開始します..."
+
+        # リクエストトークンの取得
+        echo "リクエストトークンを取得中..."
+        REQUEST_TOKEN_RESPONSE=$(curl -s -X POST \
+          -H "Content-Type: application/json; charset=UTF-8" \
+          -H "X-Accept: application/json" \
+          -d "{\"consumer_key\":\"${{ inputs.consumer_key }}\",\"redirect_uri\":\"${{ inputs.redirect_uri }}\"}" \
+          https://getpocket.com/v3/oauth/request)
+
+        # レスポンスの確認
+        if [[ $(echo "$REQUEST_TOKEN_RESPONSE" | jq -r 'has("code")') == "true" ]]; then
+          REQUEST_TOKEN=$(echo "$REQUEST_TOKEN_RESPONSE" | jq -r '.code')
+          echo "リクエストトークンを取得しました: $REQUEST_TOKEN"
+
+          # 認証URLの生成
+          AUTH_URL="https://getpocket.com/auth/authorize?request_token=${REQUEST_TOKEN}&redirect_uri=${{ inputs.redirect_uri }}"
+          echo "以下のURLにアクセスしてPocketアプリを認証してください:"
+          echo "$AUTH_URL"
+
+          # ユーザーに認証URLを表示
+          echo "::notice::Pocket認証が必要です。以下のURLにアクセスして認証を完了してください: $AUTH_URL"
+          echo "認証が完了したら、任意のキーを押して続行してください..."
+
+          # 認証完了を待機（GitHub Actionsの制約内で最善の方法）
+          sleep 30
+
+          # アクセストークンの取得
+          echo "アクセストークンを取得中..."
+          ACCESS_TOKEN_RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json; charset=UTF-8" \
+            -H "X-Accept: application/json" \
+            -d "{\"consumer_key\":\"${{ inputs.consumer_key }}\",\"code\":\"${REQUEST_TOKEN}\"}" \
+            https://getpocket.com/v3/oauth/authorize)
+
+          # レスポンスの確認
+          if [[ $(echo "$ACCESS_TOKEN_RESPONSE" | jq -r 'has("access_token")') == "true" ]]; then
+            ACCESS_TOKEN=$(echo "$ACCESS_TOKEN_RESPONSE" | jq -r '.access_token')
+            echo "アクセストークンを取得しました"
+            echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "auth_success=true" >> "$GITHUB_OUTPUT"
+
+            # 重要: このアクセストークンをGitHub Secretsに保存することをユーザーに推奨
+            echo "::notice::アクセストークンを取得しました。今後の実行のために、このトークンをGitHub Secretsに保存することを強く推奨します: $ACCESS_TOKEN"
+          else
+            echo "アクセストークンの取得に失敗しました"
+            echo "$ACCESS_TOKEN_RESPONSE" > pocket_auth_error.json
+            echo "エラーレスポンス: $ACCESS_TOKEN_RESPONSE"
+            echo "auth_success=false" >> "$GITHUB_OUTPUT"
+            echo "error_message=アクセストークンの取得に失敗しました" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+        else
+          echo "リクエストトークンの取得に失敗しました"
+          echo "$REQUEST_TOKEN_RESPONSE" > pocket_auth_error.json
+          echo "エラーレスポンス: $REQUEST_TOKEN_RESPONSE"
+          echo "auth_success=false" >> "$GITHUB_OUTPUT"
+          echo "error_message=リクエストトークンの取得に失敗しました" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
     - name: 既存の記事から最新のタイムスタンプを取得
       id: get-latest-timestamp
       shell: bash
@@ -105,6 +175,20 @@ runs:
       id: fetch-pocket-data
       shell: bash
       run: |
+        # アクセストークンの設定（入力パラメータまたは認証ステップから取得）
+        if [[ -n "${{ inputs.access_token }}" ]]; then
+          ACCESS_TOKEN="${{ inputs.access_token }}"
+          echo "入力パラメータからアクセストークンを使用します"
+        elif [[ "${{ steps.pocket-auth.outputs.auth_success }}" == "true" ]]; then
+          ACCESS_TOKEN="${{ steps.pocket-auth.outputs.access_token }}"
+          echo "認証フローで取得したアクセストークンを使用します"
+        else
+          echo "アクセストークンが提供されておらず、認証も成功していません"
+          echo "success=false" >> "$GITHUB_OUTPUT"
+          echo "error_message=アクセストークンが利用できません" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
         # 最新の記事タイムスタンプがある場合は、それ以降の記事のみを取得
         SINCE_PARAM=""
         if [[ "${{ steps.get-latest-timestamp.outputs.has_articles }}" == "true" ]]; then
@@ -133,7 +217,7 @@ runs:
           REQUEST_PARAMS=$(cat <<EOF
           {
             "consumer_key": "${{ inputs.consumer_key }}",
-            "access_token": "${{ inputs.access_token }}",
+            "access_token": "${ACCESS_TOKEN}",
             ${SINCE_PARAM}
             "state": "${{ inputs.state }}",
             "favorite": "${{ inputs.favorite }}",
@@ -264,18 +348,32 @@ runs:
           TAGS=$(echo "$item" | jq -r '.tags | join(", ")')
 
           # マークダウンファイルを作成
-          cat > "${{ inputs.output_dir }}/$FILENAME" << EOF
+          if [ -n "$TAGS" ]; then
+            cat > "${{ inputs.output_dir }}/$FILENAME" << EOF
 # ${TITLE}
 
 - URL: ${URL}
 - 追加日時: ${ADDED_DATE}
-$([ -n "$TAGS" ] && echo "- タグ: ${TAGS}")
+- タグ: ${TAGS}
 
 ## 概要
 
 ${EXCERPT}
 
 EOF
+          else
+            cat > "${{ inputs.output_dir }}/$FILENAME" << EOF
+# ${TITLE}
+
+- URL: ${URL}
+- 追加日時: ${ADDED_DATE}
+
+## 概要
+
+${EXCERPT}
+
+EOF
+          fi
 
           # ファイルをGitに追加
           git add "${{ inputs.output_dir }}/$FILENAME"
